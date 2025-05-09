@@ -60,6 +60,11 @@ services:
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
       - xpack.security.enabled=false
       - xpack.security.http.ssl.enabled=false
+      - cluster.name=docker-cluster
+      - transport.host=0.0.0.0
+      - http.host=0.0.0.0
+      - "http.cors.enabled=true"
+      - "http.cors.allow-origin=*"
     ports:
       - "9200:9200"
       - "9300:9300"
@@ -70,6 +75,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 30s
+
+  kibana:
+    image: kibana:8.12.2
+    container_name: kibana
+    networks:
+      - app_net
+    depends_on:
+      - elasticsearch
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=kibana.example.org
+      - XPACK_SECURITY_ENABLED=false
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q '200 OK'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   postgres:
     build:
@@ -111,16 +137,8 @@ services:
       - postgres
     environment:
       - PYTHONUNBUFFERED=1
-    command: sh -c "
-      echo 'Проверка готовности баз данных...';
-      wait-for-it postgres:5432 --timeout=0 &&
-      wait-for-it mongo:27017 --timeout=0 &&
-      wait-for-it redis:6379 --timeout=0 &&
-      wait-for-it neo4j:7687 --timeout=0 &&
-      wait-for-it elasticsearch:9200 --timeout=0 &&
-      echo 'Все БД готовы. Запуск скрипта...';
-      python ./insert.py"
-    
+    command: sh -c " echo 'Проверка готовности баз данных...'; wait-for-it postgres:5432 --timeout=0 && wait-for-it mongo:27017 --timeout=0 && wait-for-it redis:6379 --timeout=0 && wait-for-it neo4j:7687 --timeout=0 && wait-for-it elasticsearch:9200 --timeout=0 && echo 'Все БД готовы. Запуск скрипта...'; python ./insert.py"
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.2.1
     container_name: zookeeper
@@ -130,7 +148,7 @@ services:
     networks:
       - app_net
     healthcheck:
-      test: ["CMD-SHELL", "echo stat | nc zookeeper 2181 | grep Mode"]
+      test: [ "CMD-SHELL", "echo stat | nc zookeeper 2181 | grep Mode" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -152,57 +170,86 @@ services:
     networks:
       - app_net
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-verification --bootstrap-server kafka:9092 --version"]
+      test: [ "CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list" ]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 20s
 
   kafka-connect:
-    image: debezium/connect:2.2
+    image: debezium/connect:1.9
     container_name: kafka-connect
     depends_on:
       - kafka
       - postgres
+      - elasticsearch
     ports:
       - "8085:8083"
     environment:
-      BOOTSTRAP_SERVERS: 'kafka:9092'
-      GROUP_ID: '1'
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
       CONFIG_STORAGE_TOPIC: my_connect_configs
       OFFSET_STORAGE_TOPIC: my_connect_offsets
       STATUS_STORAGE_TOPIC: my_connect_statuses
       KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      KEY_CONVERTER_SCHEMAS_ENABLE: 'false'
-      VALUE_CONVERTER_SCHEMAS_ENABLE: 'false'
-      CONNECT_PLUGIN_PATH: "/kafka/connect"
+      KEY_CONVERTER_SCHEMAS_ENABLE: false
+      VALUE_CONVERTER_SCHEMAS_ENABLE: false
+      CONNECT_REST_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_ADVERTISED_PORT: 8083
+      PLUGIN_PATH: /kafka/connect
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_FLUSH_INTERVAL_MS: 10000
+    volumes:
+      - ./confluent-connectors:/kafka/connect/confluent-connectors
     networks:
       - app_net
-    
+    restart: on-failure
+    command: |
+      bash -c '
+        echo "Installing Confluent Elasticsearch Connector..."
+        mkdir -p /kafka/connect/confluent-connectors
+        curl -k -SL "https://d1i4a15mxbxib1.cloudfront.net/api/plugins/confluentinc/kafka-connect-elasticsearch/versions/14.0.6/confluentinc-kafka-connect-elasticsearch-14.0.6.zip" > /tmp/elasticsearch-connector.zip
+        unzip -o /tmp/elasticsearch-connector.zip -d /kafka/connect/confluent-connectors
+        rm /tmp/elasticsearch-connector.zip
+        echo "Installed Elasticsearch Connector. Starting Kafka Connect..."
+        /docker-entrypoint.sh start'
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8083/" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   connector-setup:
     image: curlimages/curl:7.87.0
     container_name: connector-setup
     depends_on:
       - kafka-connect
-    entrypoint: 
+    entrypoint:
       - sh
       - -c
       - |
         echo 'Waiting for Kafka Connect to start...';
-        until curl -s http://kafka-connect:8083/connectors; do
-          sleep 5;
-        done;
-        echo 'Kafka Connect is ready. Registering connector...';
+        sleep 30;
+        echo "Checking Kafka Connect version...";
+        curl -v http://kafka-connect:8083/ | grep version;
+        echo "Registering connector...";
         curl -X POST http://kafka-connect:8083/connectors \
           -H 'Content-Type: application/json' \
           --data @/connectors/postgres.json \
-          --fail || echo 'Failed to register connector';
-        sleep 5
+          -v;
+        echo "Checking connector status...";
+        sleep 10;
+        curl -v http://kafka-connect:8083/connectors;
     volumes:
       - ./connectors/postgres.json:/connectors/postgres.json:ro
     networks:
       - app_net
-  
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -292,6 +339,33 @@ services:
       retries: 10
       start_period: 40s
 
+  elasticsearch-connector:
+    image: curlimages/curl:7.87.0
+    container_name: elasticsearch-connector
+    depends_on:
+      - kafka-connect
+      - elasticsearch
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo 'Waiting for Kafka Connect and ElasticSearch to start...';
+        sleep 60;
+        echo "Checking ElasticSearch health...";
+        curl -v http://elasticsearch:9200/_cluster/health;
+        echo "Registering ElasticSearch Sink connector...";
+        curl -X POST http://kafka-connect:8083/connectors \
+          -H 'Content-Type: application/json' \
+          --data @/connectors/elasticsearch-sink.json \
+          -v;
+        echo "Checking connectors status...";
+        sleep 10;
+        curl -v http://kafka-connect:8083/connectors;
+    volumes:
+      - ./connectors/elasticsearch-sink.json:/connectors/elasticsearch-sink.json:ro
+    networks:
+      - app_net
+
 volumes:
   redis-data:
   mongo-data:
@@ -299,6 +373,7 @@ volumes:
   neo4j-logs:
   elasticsearch-data:
   postgres-data:
+
 
 networks:
   app_net:

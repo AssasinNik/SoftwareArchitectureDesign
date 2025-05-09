@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     postgresql-server-dev-15 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Клонируем репозиторий и устанавливаем с USE_PGXS=1
@@ -16,3 +17,9 @@ RUN git clone https://github.com/eulerto/wal2json.git /tmp/wal2json \
     && USE_PGXS=1 make \
     && USE_PGXS=1 make install \
     && rm -rf /tmp/wal2json
+
+# Создаем инициализационный скрипт для настройки репликации
+COPY init-db.sh /docker-entrypoint-initdb.d/
+
+# Делаем скрипт исполнимым
+RUN chmod +x /docker-entrypoint-initdb.d/init-db.sh
